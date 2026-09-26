@@ -71,7 +71,11 @@ def make_handler(service: Service, static_dir: str):
                 status = 400
             else:
                 status = 500
-            self._json(status, {"error": exc.__class__.__name__, "message": str(exc)})
+            details = getattr(exc, "details", None)
+            payload = {"error": exc.__class__.__name__, "message": str(exc)}
+            if details is not None:
+                payload["details"] = details
+            self._json(status, payload)
 
         def do_GET(self) -> None:
             try:
@@ -110,6 +114,14 @@ def make_handler(service: Service, static_dir: str):
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
+                elif (path.startswith("/api/items/") and
+                      (path.endswith("/escalation-confirmation") or
+                       path.endswith("/escalation-confirmations"))):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.confirm_escalation(item_id, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/estimate"):
+                    item_id = int(path.split("/")[3])
+                    self._json(200, service.correct_estimate(item_id, body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))
@@ -119,6 +131,19 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                else:
+                    self._json(404, {"error": "not_found"})
+            except Exception as exc:
+                self._send_error(exc)
+
+        def do_PATCH(self) -> None:
+            try:
+                path = urlparse(self.path).path
+                actor, role = self._identity()
+                body = self._body()
+                if path.startswith("/api/items/") and path.endswith("/estimate"):
+                    item_id = int(path.split("/")[3])
+                    self._json(200, service.correct_estimate(item_id, body, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:

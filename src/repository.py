@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -21,6 +22,11 @@ class Repository:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self._create_schema()
+
+    @contextmanager
+    def locked(self):
+        with self._lock:
+            yield
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
@@ -54,6 +60,25 @@ class Repository:
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
                 );
+                CREATE TABLE IF NOT EXISTS escalation_confirmations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    estimated_quantity REAL NOT NULL,
+                    threshold REAL NOT NULL,
+                    severity TEXT NOT NULL,
+                    criterion TEXT NOT NULL,
+                    item_version INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active'
+                        CHECK(status IN ('active','invalidated')),
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    invalidated_reason TEXT,
+                    invalidated_by TEXT,
+                    invalidated_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_active_escalation_confirmation
+                    ON escalation_confirmations(item_id)
+                    WHERE status='active';
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -66,6 +91,12 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+
+    @staticmethod
+    def _confirmation(row: sqlite3.Row) -> Dict[str, Any]:
+        confirmation = dict(row)
+        confirmation["criterion"] = json.loads(confirmation["criterion"])
+        return confirmation
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -106,6 +137,104 @@ class Repository:
         with self._lock:
             rows = self.conn.execute(sql, params).fetchall()
         return [self._item(row) for row in rows]
+
+    def get_latest_confirmation(self, item_id: int) -> Optional[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT c.* FROM escalation_confirmations c
+                   JOIN (SELECT item_id, MAX(id) AS id FROM escalation_confirmations
+                         WHERE item_id=? GROUP BY item_id) latest
+                   ON latest.id=c.id""",
+                (item_id,),
+            ).fetchone()
+        return self._confirmation(row) if row else None
+
+    def latest_confirmation_map(self) -> Dict[int, Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT c.* FROM escalation_confirmations c
+                   JOIN (SELECT item_id, MAX(id) AS id
+                         FROM escalation_confirmations GROUP BY item_id) latest
+                   ON latest.id=c.id"""
+            ).fetchall()
+        return {int(row["item_id"]): self._confirmation(row) for row in rows}
+
+    def create_escalation_confirmation(self, item_id: int, estimated_quantity: float,
+                                       threshold: float, severity: str,
+                                       criterion: dict, item_version: int,
+                                       actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM items WHERE id=?", (item_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("项目不存在")
+            if int(row["version"]) != item_version:
+                raise ConflictError("版本冲突，请刷新后重试")
+            if row["status"] != "assessing":
+                raise ConflictError("只有评估中的事件可以提交升级确认")
+            try:
+                cur = self.conn.execute(
+                    """INSERT INTO escalation_confirmations(item_id, estimated_quantity,
+                       threshold, severity, criterion, item_version, status, created_by,
+                       created_at) VALUES(?,?,?,?,?,?, 'active', ?,?)""",
+                    (item_id, estimated_quantity, threshold, severity,
+                     json.dumps(criterion, ensure_ascii=False, sort_keys=True),
+                     item_version, actor, now),
+                )
+                confirmation_id = int(cur.lastrowid)
+            except sqlite3.IntegrityError as exc:
+                raise ConflictError("已有有效升级确认，请勿重复提交") from exc
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM escalation_confirmations WHERE id=?", (confirmation_id,)
+            ).fetchone()
+        return self._confirmation(row)
+
+    def correct_estimate(self, item_id: int, quantity: float, expected_version: int,
+                         invalidated_reason: str, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            current = self.conn.execute(
+                "SELECT * FROM items WHERE id=?", (item_id,)
+            ).fetchone()
+            if current is None:
+                raise NotFoundError("项目不存在")
+            if int(current["version"]) != expected_version:
+                raise ConflictError("版本冲突，请刷新后重试")
+            if current["status"] not in ("reported", "assessing"):
+                raise ConflictError("事件已进入围控，不能再更正估算油量")
+            cur = self.conn.execute(
+                """UPDATE items SET quantity=?, version=version+1, updated_at=?
+                   WHERE id=? AND version=?""",
+                (quantity, now, item_id, expected_version),
+            )
+            if cur.rowcount == 0:
+                raise ConflictError("版本冲突，请刷新后重试")
+            old_rows = self.conn.execute(
+                "SELECT id FROM escalation_confirmations WHERE item_id=? AND status='active'",
+                (item_id,),
+            ).fetchall()
+            invalidated_ids = [int(row["id"]) for row in old_rows]
+            self.conn.execute(
+                """UPDATE escalation_confirmations
+                   SET status='invalidated', invalidated_reason=?, invalidated_by=?,
+                       invalidated_at=?
+                   WHERE item_id=? AND status='active'""",
+                (invalidated_reason, actor, now, item_id),
+            )
+        item = self.get_item(item_id)
+        confirmations = []
+        if invalidated_ids:
+            with self._lock:
+                rows = self.conn.execute(
+                    f"SELECT * FROM escalation_confirmations WHERE id IN ({','.join('?' for _ in invalidated_ids)}) ORDER BY id",
+                    invalidated_ids,
+                ).fetchall()
+            confirmations = [self._confirmation(row) for row in rows]
+        return {"item": item, "invalidated_confirmations": confirmations}
 
     def transition_item(self, item_id: int, target: str, expected_version: int,
                         actor: str) -> Dict[str, Any]:

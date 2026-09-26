@@ -29,10 +29,12 @@ python3 app.py --db ./data.db --port 8320
 - `POST /api/items`
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
-- `POST /api/items/{id}/transition`，必须提交`expected_version`
+- `POST /api/items/{id}/escalation-confirmation`，指挥官确认越过升级线（自动登记当前估算、判据和事件版本）
+- `PATCH /api/items/{id}/estimate`（也支持POST），提交`quantity`和`expected_version`更正估算；更正会使旧升级确认失效
+- `POST /api/items/{id}/transition`，必须提交`expected_version`；从`assessing`进入`containing`时，越过升级线必须持有当前版本的有效确认
 - `GET /api/audit`
 
-允许角色：observer, response_commander, operations, viewer。估算油量、海况和未完成任务数影响响应等级；关闭前必须完成回收和岸线监测记录。
+允许角色：observer, response_commander, operations, viewer。估算油量、海况和未完成任务数影响响应等级；估算越过升级线（quantity >= threshold）或severity为catastrophic时，必须由response_commander确认后才能围控。更正估算会递增事件版本，并自动将旧确认标记为invalidated。详情和列表返回`escalation_confirmation_status`与`escalation_confirmation_invalidated_reason`；确认、估算更正和确认失效均进入审计。关闭前必须完成回收和岸线监测记录。
 
 ## 测试
 

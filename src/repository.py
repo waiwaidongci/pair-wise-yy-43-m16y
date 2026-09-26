@@ -54,6 +54,22 @@ class Repository:
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
                 );
+                CREATE TABLE IF NOT EXISTS escalation_confirmations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    quantity REAL NOT NULL,
+                    criterion TEXT NOT NULL,
+                    item_version INTEGER NOT NULL,
+                    note TEXT,
+                    status TEXT NOT NULL DEFAULT 'valid'
+                        CHECK(status IN ('valid','invalidated')),
+                    invalid_reason TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    invalidated_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS ix_escalation_item
+                    ON escalation_confirmations(item_id, id);
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -122,6 +138,82 @@ class Repository:
                     raise NotFoundError("项目不存在")
                 raise ConflictError("版本冲突，请刷新后重试")
         return self.get_item(item_id)
+
+    def add_escalation_confirmation(self, item_id: int, quantity: float,
+                                    criterion: str, item_version: int,
+                                    note: Optional[str], actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        self.get_item(item_id)
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO escalation_confirmations(item_id, quantity, criterion,
+                   item_version, note, status, created_by, created_at)
+                   VALUES(?,?,?,?,?, 'valid', ?,?)""",
+                (item_id, quantity, criterion, item_version, note, actor, now),
+            )
+            confirmation_id = int(cur.lastrowid)
+        return self.get_escalation_confirmation(confirmation_id)
+
+    def get_escalation_confirmation(self, confirmation_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM escalation_confirmations WHERE id=?", (confirmation_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("升级确认不存在")
+        return dict(row)
+
+    def get_latest_confirmation(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT * FROM escalation_confirmations WHERE item_id=?
+                   ORDER BY id DESC LIMIT 1""",
+                (item_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def latest_confirmation_map(self) -> Dict[int, Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT c.* FROM escalation_confirmations c
+                   JOIN (SELECT item_id, MAX(id) AS max_id FROM escalation_confirmations
+                         GROUP BY item_id) m ON m.max_id=c.id"""
+            ).fetchall()
+        return {int(row["item_id"]): dict(row) for row in rows}
+
+    def correct_quantity(self, item_id: int, quantity: float,
+                         expected_version: Optional[int], actor: str
+                         ) -> Dict[str, Any]:
+        """更正估算油量：版本+1，并在同一事务内作废所有有效确认。"""
+        now = utc_now()
+        with self._lock, self.conn:
+            if expected_version is not None:
+                cur = self.conn.execute(
+                    """UPDATE items SET quantity=?, version=version+1, updated_at=?
+                       WHERE id=? AND version=?""",
+                    (quantity, now, item_id, expected_version),
+                )
+                if cur.rowcount == 0:
+                    exists = self.conn.execute(
+                        "SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone()
+                    if exists is None:
+                        raise NotFoundError("项目不存在")
+                    raise ConflictError("版本冲突，请刷新后重试")
+            else:
+                cur = self.conn.execute(
+                    """UPDATE items SET quantity=?, version=version+1, updated_at=?
+                       WHERE id=?""",
+                    (quantity, now, item_id),
+                )
+                if cur.rowcount == 0:
+                    raise NotFoundError("项目不存在")
+            inv = self.conn.execute(
+                """UPDATE escalation_confirmations SET status='invalidated',
+                   invalid_reason=?, invalidated_at=?
+                   WHERE item_id=? AND status='valid'""",
+                ("quantity_corrected", now, item_id),
+            )
+        return {"item": self.get_item(item_id), "invalidated_count": int(inv.rowcount or 0)}
 
     def add_record(self, item_id: int, kind: str, detail: str, status: str,
                    external_ref: Optional[str], actor: str) -> Dict[str, Any]:

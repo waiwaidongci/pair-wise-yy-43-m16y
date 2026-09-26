@@ -30,9 +30,17 @@ python3 app.py --db ./data.db --port 8320
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
+- `POST /api/items/{id}/escalation-confirmation`，指挥官升级确认（report/assessing阶段）
+- `POST /api/items/{id}/estimate`，更正估算油量，旧升级确认自动作废
 - `GET /api/audit`
 
 允许角色：observer, response_commander, operations, viewer。估算油量、海况和未完成任务数影响响应等级；关闭前必须完成回收和岸线监测记录。
+
+### 升级确认
+
+估算油量越过升级线（`quantity>=threshold`或severity为`catastrophic`）后，事件从`assessing`进入`containing`前，必须由`response_commander`提交升级确认，登记当时的估算值、判据（`quantity_at_threshold`/`severity_catastrophic`）和事件版本。缺少有效确认时过渡返回409，响应体`details.step`指明卡在`escalation_confirmation`，`reason`说明缺失或失效原因（`missing_confirmation`/`quantity_corrected`）。
+
+在`reported`/`assessing`阶段更正估算油量会使事件版本+1，并将既有有效确认置为`invalidated`（原因`quantity_corrected`），需要重新确认。事件详情和列表均带出`escalation_confirmation`（确认状态、登记值、判据、版本、失效原因与时间）。确认（`escalation_confirmed`）与更正（`estimate_corrected`）均写入审计链。
 
 ## 测试
 
